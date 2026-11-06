@@ -13,7 +13,7 @@ Each report is posted at about 00:17 UTC, shortly after AIHOT publishes it at 00
    gh secret set DISCORD_WEBHOOK_URL -R Kevin09sun/aihot-discord-daily
    ```
 
-Translation uses GitHub Models through the workflow's built-in token, so it needs no extra key.
+Translation uses Google Translate's free web endpoint, so it needs no key or account. The endpoint is unofficial and could change or start blocking requests. If that happens, the run fails rather than posting untranslated text, and GitHub emails you about the failed run.
 
 ## Running it manually
 
@@ -24,7 +24,6 @@ Under Actions → Daily AI report → Run workflow:
 
 ## Configuration
 
-- **Model:** set a repository variable named `TRANSLATION_MODEL` to change the GitHub Models id. A dry run lists the available ids.
 - **Time:** change the `cron` lines in `.github/workflows/daily.yml`. Times are in UTC.
 - **Duplicates:** the last posted date is stored in `state/last_posted.txt`.
 

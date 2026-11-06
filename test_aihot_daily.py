@@ -23,11 +23,8 @@ def report(items=2, flashes=1, label="模型发布/更新", lead=True):
     }
 
 
-def fake_complete(inputs):
-    """Stand-in model: replaces every value with English text."""
-    return json.dumps({"items": [
-        {k: (v if k == "id" else f"english {k}") for k, v in item.items()} for item in inputs
-    ]})
+def fake_translator(text):
+    return f"english {text}"
 
 
 def no_sleep(_seconds):
@@ -59,71 +56,73 @@ class NormalizeTests(unittest.TestCase):
 
 class TranslateTests(unittest.TestCase):
     def test_translates_all_text_and_leaves_links_alone(self):
-        digest = a.translate(a.normalize(report()), fake_complete, no_sleep)
+        digest = a.translate(a.normalize(report()), fake_translator, no_sleep)
         item = digest["sections"][0]["items"][0]
-        self.assertEqual(item["title"], "english title")
-        self.assertEqual(item["source"], "english source")
+        self.assertEqual(item["title"], "english 标题0")
+        self.assertEqual(item["summary"], "english 摘要")
+        self.assertEqual(item["source"], "english 来源")
         self.assertEqual(item["url"], "https://example.com/a")
-        self.assertEqual(digest["lead"]["summary"], "english summary")
-        self.assertEqual(digest["flashes"][0]["title"], "english title")
+        self.assertEqual(digest["lead"]["summary"], "english 导语")
+        self.assertEqual(digest["flashes"][0]["title"], "english 标题f0")
 
-    def test_known_label_is_not_sent_but_unknown_label_is(self):
+    def test_does_not_change_the_input(self):
+        digest = a.normalize(report())
+        a.translate(digest, fake_translator, no_sleep)
+        self.assertEqual(digest["lead"]["title"], "头条")
+
+    def test_repeated_text_is_translated_once_and_english_is_skipped(self):
         seen = []
-        def complete(inputs):
-            seen.extend(i["id"] for i in inputs)
-            return fake_complete(inputs)
-        a.translate(a.normalize(report()), complete, no_sleep)
-        self.assertNotIn("label0", seen)
-        digest = a.translate(a.normalize(report(label="新版块")), complete, no_sleep)
-        self.assertIn("label0", seen)
-        self.assertEqual(digest["sections"][0]["label"], "english title")
+        def translator(text):
+            seen.append(text)
+            return "english"
+        raw = report(items=3, flashes=0, lead=False)
+        raw["sections"][0]["items"][0]["title"] = "Already English"
+        a.translate(a.normalize(raw), translator, no_sleep)
+        self.assertEqual(seen.count("摘要"), 1)
+        self.assertNotIn("Already English", seen)
 
-    def test_splits_requests_into_chunks(self):
-        sizes = []
-        def complete(inputs):
-            sizes.append(len(inputs))
-            return fake_complete(inputs)
-        a.translate(a.normalize(report(items=25, flashes=0)), complete, no_sleep)
-        self.assertEqual(sum(sizes), 26)
-        self.assertLessEqual(max(sizes), a.TRANSLATION_CHUNK)
+    def test_known_label_is_kept_but_unknown_label_is_translated(self):
+        digest = a.translate(a.normalize(report()), fake_translator, no_sleep)
+        self.assertEqual(digest["sections"][0]["label"], "模型发布/更新")
+        digest = a.translate(a.normalize(report(label="新版块")), fake_translator, no_sleep)
+        self.assertEqual(digest["sections"][0]["label"], "english 新版块")
 
-    def test_retries_bad_output_then_succeeds(self):
-        replies = iter(["not json", json.dumps({"items": []})])
-        def complete(inputs):
-            return next(replies, None) or fake_complete(inputs)
-        digest = a.translate(a.normalize(report(items=1, flashes=0, lead=False)), complete, no_sleep)
-        self.assertEqual(digest["sections"][0]["items"][0]["title"], "english title")
-
-    def test_raises_when_output_stays_unusable(self):
+    def test_translation_failure_stops_the_run(self):
+        def translator(_text):
+            raise a.FetchError("blocked")
         with self.assertRaises(a.FetchError):
-            a.translate(a.normalize(report()), lambda _: "nope", no_sleep)
+            a.translate(a.normalize(report()), translator, no_sleep)
 
-    def test_raises_when_a_field_is_dropped(self):
-        def complete(inputs):
-            return json.dumps({"items": [{"id": i["id"], "title": "x"} for i in inputs]})
-        with self.assertRaises(a.FetchError):
-            a.translate(a.normalize(report(lead=False)), complete, no_sleep)
-
-    def test_accepts_leftover_chinese_after_retrying(self):
-        calls = []
-        def complete(inputs):
-            calls.append(1)
-            return json.dumps({"items": [
-                {k: (v if k == "id" else "名字") for k, v in i.items()} for i in inputs
-            ]})
-        digest = a.translate(a.normalize(report(items=1, flashes=0, lead=False)), complete, no_sleep)
-        self.assertEqual(len(calls), a.TRANSLATION_ATTEMPTS)
+    def test_leftover_chinese_is_accepted(self):
+        digest = a.translate(a.normalize(report(lead=False)), lambda _: "名字", no_sleep)
         self.assertEqual(digest["sections"][0]["items"][0]["title"], "名字")
 
-    def test_fenced_json_is_accepted(self):
-        inputs = [{"id": "x", "title": "t"}]
-        text = '```json\n{"items":[{"id":"x","title":"Hello"}]}\n```'
-        self.assertEqual(a.parse_translation(text, inputs), {"x": {"title": "Hello"}})
+    def test_shorten_source(self):
+        cases = {
+            "OpenAI：官网动态（RSS · 排除企业/客户案例）": "OpenAI",
+            "Meta：Newsroom · AI（RSS）": "Meta",
+            "Goodfire Research（网页）": "Goodfire Research",
+            "Reflection Blog": "Reflection Blog",
+            "X：Tibo (@thsottiaux)": "Tibo on X",
+            "X：Mustafa Suleyman（Microsoft AI CEO） (@mustafasuleyman)": "Mustafa Suleyman on X",
+            "Xcode：Blog": "Xcode",
+        }
+        for name, expected in cases.items():
+            self.assertEqual(a.shorten_source(name), expected)
+
+    def test_parse_google_response_joins_segments(self):
+        raw = json.dumps([[["Hello. ", "你好。"], ["World", "世界"]], None, "zh-CN"])
+        self.assertEqual(a.parse_google_response(raw), "Hello. World")
+
+    def test_parse_google_response_rejects_bad_output(self):
+        for raw in ("OK", "<html>blocked</html>", "[]", "[null]", json.dumps([[["", "你好"]]])):
+            with self.assertRaises(a.FetchError):
+                a.parse_google_response(raw)
 
 
 class FormatTests(unittest.TestCase):
     def english(self, **kwargs):
-        return a.translate(a.normalize(report(**kwargs)), fake_complete, no_sleep)
+        return a.translate(a.normalize(report(**kwargs)), fake_translator, no_sleep)
 
     def test_header_and_english_section_title(self):
         embeds = a.build_embeds(self.english())
@@ -136,7 +135,7 @@ class FormatTests(unittest.TestCase):
         text = a.build_embeds(self.english())[1]["description"]
         self.assertIn("(https://example.com/a)", text)
         self.assertIn("[AIHOT](https://aihot.news/items/0)", text)
-        self.assertIn("*english source*", text)
+        self.assertIn("*english 来源*", text)
 
     def test_last_embed_credits_source_and_discloses_translation(self):
         footer = a.build_embeds(self.english())[-1]["footer"]["text"]

@@ -19,7 +19,6 @@ on:
 
 permissions:
   contents: write
-  models: read
 
 concurrency:
   group: daily-report
@@ -37,9 +36,7 @@ jobs:
         run: python -m unittest -v
       - name: Build and post report
         env:
-          GITHUB_TOKEN: ${{ github.token }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          TRANSLATION_MODEL: ${{ vars.TRANSLATION_MODEL }}
           DRY_RUN: ${{ inputs.dry_run }}
           FORCE: ${{ inputs.force }}
         run: |
