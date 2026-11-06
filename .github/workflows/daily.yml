@@ -1,0 +1,57 @@
+name: Daily AI report
+
+on:
+  schedule:
+    # AIHOT publishes at 00:00 UTC (08:00 Beijing). The second run is a backup
+    # for a late report or a failed run; it does nothing if the first one posted.
+    - cron: "17 0 * * *"
+    - cron: "47 2 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the report in the log without posting"
+        type: boolean
+        default: true
+      force:
+        description: "Post even if this report was already posted"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  models: read
+
+concurrency:
+  group: daily-report
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Run tests
+        run: python -m unittest -v
+      - name: Build and post report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TRANSLATION_MODEL: ${{ vars.TRANSLATION_MODEL }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ "$FORCE" = "true" ]; then args+=(--force); fi
+          python aihot_daily.py "${args[@]}"
+      - name: Save last posted date
+        run: |
+          git add state
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Record posted report"
+          git push
