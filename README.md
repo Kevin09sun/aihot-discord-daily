@@ -15,6 +15,10 @@ Each report is posted at about 00:17 UTC, shortly after AIHOT publishes it at 00
 
 Translation uses Google Translate's free web endpoint, so it needs no key or account. The endpoint is unofficial and could change or start blocking requests. If that happens, the run fails rather than posting untranslated text, and GitHub emails you about the failed run.
 
+## Images and links
+
+Each main story is its own card, showing the preview image its source page publishes. A story goes without an image if the page has none, blocks the request, or only offers an X profile picture. Quick hits stay as a text list. All links go to the original source, never to AIHOT.
+
 ## Running it manually
 
 Under Actions → Daily AI report → Run workflow:

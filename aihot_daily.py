@@ -10,6 +10,9 @@ Environment:
 import argparse
 import copy
 import datetime as dt
+import html
+import http.client
+import ipaddress
 import json
 import os
 import re
@@ -30,9 +33,13 @@ STATE_FILE = Path(__file__).parent / "state" / "last_posted.txt"
 MAX_DESCRIPTION = 4000
 MAX_MESSAGE_CHARS = 5800
 MAX_EMBEDS = 10
-MAX_TITLE_CHARS = 300
+MAX_TITLE_CHARS = 240
+MAX_EMBED_TITLE = 256
 MAX_SUMMARY_CHARS = 700
 MAX_URL_CHARS = 500
+MAX_IMAGE_URL_CHARS = 2000
+MAX_PAGE_BYTES = 1_000_000
+PAGE_TIMEOUT_SECONDS = 15
 MAX_TRANSLATION_INPUT = 2000
 TRANSLATION_PAUSE_SECONDS = 0.2
 
@@ -46,6 +53,7 @@ SECTION_STYLES = {
     "技巧与观点": ("💡", "Tips & Opinions", 0x1ABC9C),
 }
 DEFAULT_STYLE = ("📌", None, 0x95A5A6)
+AIHOT_HOSTS = ("aihot.news", "aihot.virxact.com")
 
 CJK =re.compile(r"[㐀-鿿豈-﫿]")
 MARKDOWN = re.compile(r"([\\`*_~|\[\]<>#])")
@@ -103,22 +111,27 @@ def clean(text, limit=None):
     return text
 
 
+def is_aihot_host(host):
+    return any(host == h or host.endswith("." + h) for h in AIHOT_HOSTS)
+
+
 def safe_url(url):
+    """Return an https link to a story's source, or "" if it can't be used."""
     url = str(url or "").strip()
     if not url.startswith("https://") or len(url) > MAX_URL_CHARS or re.search(r"\s", url):
+        return ""
+    if is_aihot_host((urllib.parse.urlsplit(url).hostname or "").lower()):
         return ""
     return url.replace("(", "%28").replace(")", "%29")
 
 
 def normalize_item(raw):
-    aihot = safe_url((raw.get("links") or {}).get("aihot"))
-    original = safe_url((raw.get("links") or {}).get("original"))
     return {
         "title": clean(raw.get("title")),
         "summary": clean(raw.get("summary")),
         "source": clean((raw.get("source") or {}).get("name")),
-        "url": original or aihot,
-        "aihot": aihot if original else "",
+        "url": safe_url((raw.get("links") or {}).get("original")),
+        "image": "",
     }
 
 
@@ -135,7 +148,6 @@ def normalize(report):
         raise FetchError(f"AIHOT report {report.get('date')} has no items")
     return {
         "date": report["date"],
-        "url": safe_url((report.get("links") or {}).get("aihot")),
         "lead": lead and {
             "title": clean(lead.get("title")),
             "summary": clean(lead.get("leadParagraph")),
@@ -206,24 +218,101 @@ def translate(digest, translator=google_translate, sleep=time.sleep):
     return digest
 
 
+def usable_image(url):
+    """Reject images Discord can't load, and X profile pictures."""
+    if not url.startswith("https://") or len(url) > MAX_IMAGE_URL_CHARS or re.search(r"\s", url):
+        return False
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host or host == "localhost" or host.endswith(".local") or is_aihot_host(host):
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    return "/profile_images/" not in url
+
+
+def parse_preview_image(page, base_url):
+    """Return the page's Open Graph or Twitter preview image URL, or ""."""
+    found = {}
+    for tag in re.findall(rb"<meta\b[^>]*>", page, re.I):
+        name = re.search(rb"""(?:property|name)\s*=\s*["']([^"']+)["']""", tag, re.I)
+        content = re.search(rb"""content\s*=\s*"([^"]+)"|content\s*=\s*'([^']+)'""", tag, re.I)
+        if name and content:
+            key = name.group(1).decode("ascii", "ignore").lower()
+            value = content.group(1) or content.group(2)
+            found.setdefault(key, value.decode("utf-8", "replace"))
+    for key in ("og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"):
+        if key in found:
+            url = urllib.parse.urljoin(base_url, html.unescape(found[key]).strip())
+            if usable_image(url):
+                return url
+    return ""
+
+
+def open_page(url, read_bytes=0):
+    """Return (content type, body). Raises OSError or HTTPException on failure."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=PAGE_TIMEOUT_SECONDS) as resp:
+        return resp.headers.get_content_type(), resp.read(read_bytes) if read_bytes else b""
+
+
+def find_image(url):
+    """Find a story's preview image. Images are optional, so failures return ""."""
+    try:
+        content_type, page = open_page(url, MAX_PAGE_BYTES)
+        if "html" not in content_type:
+            return ""
+        image = parse_preview_image(page, url)
+        if not image:
+            return ""
+        content_type, _ = open_page(image)
+        return image if content_type.startswith("image/") else ""
+    except (OSError, ValueError, http.client.HTTPException) as err:
+        print(f"note: no image for {url[:80]}: {err}", file=sys.stderr)
+        return ""
+
+
+def attach_images(digest, finder=find_image):
+    """Add preview images to the main stories. Returns how many were found."""
+    count = 0
+    for section in digest["sections"]:
+        for item in section["items"]:
+            item["image"] = finder(item["url"]) if item["url"] else ""
+            count += bool(item["image"])
+    return count
+
+
 def md(text, limit=None):
     """Escape Discord markdown in third-party text so it stays plain text."""
     return MARKDOWN.sub(r"\\\1", clean(text, limit))
 
 
-def format_item(item):
-    title = md(item["title"], MAX_TITLE_CHARS)
-    lines = [f"**[{title}]({item['url']})**" if item["url"] else f"**{title}**"]
+def story_embed(item, color, section_title=None):
+    """Build one story card. Its title and source line link to the original."""
+    title = md(item["title"], MAX_TITLE_CHARS)[:MAX_EMBED_TITLE].rstrip("\\")
+    source = md(item["source"], 100)
+    lines = []
     if item["summary"]:
         lines.append(md(item["summary"], MAX_SUMMARY_CHARS))
-    meta = []
-    if item["source"]:
-        meta.append(f"*{md(item['source'], 100)}*")
-    if item["aihot"]:
-        meta.append(f"[AIHOT]({item['aihot']})")
-    if meta:
-        lines.append(" · ".join(meta))
-    return "\n".join(lines)
+    if item["url"]:
+        lines.append(f"🔗 [{source or 'Read the source'}]({item['url']})")
+    elif source:
+        lines.append(f"*{source}*")
+    embed = {"title": title, "color": color}
+    if lines:
+        embed["description"] = "\n\n".join(lines)
+    if item["url"]:
+        embed["url"] = item["url"]
+    if item["image"]:
+        embed["image"] = {"url": item["image"]}
+    if section_title:
+        embed["author"] = {"name": section_title}
+    return embed
 
 
 def format_flash(item):
@@ -272,35 +361,33 @@ def build_embeds(digest):
     hits = len(digest["flashes"])
     if hits:
         counts += f" · {hits} quick {'hit' if hits == 1 else 'hits'}"
+    links = {i["title"]: i["url"] for s in digest["sections"] for i in s["items"]}
+    summaries = {i["summary"] for s in digest["sections"] for i in s["items"]}
     parts = []
     if digest["lead"]:
-        parts.append(f"**{md(digest['lead']['title'], MAX_TITLE_CHARS)}**")
-        summaries = {i["summary"] for s in digest["sections"] for i in s["items"]}
+        lead_title = md(digest["lead"]["title"], MAX_TITLE_CHARS)
+        lead_url = links.get(digest["lead"]["title"])
+        parts.append(f"**[{lead_title}]({lead_url})**" if lead_url else f"**{lead_title}**")
         if digest["lead"]["summary"] and digest["lead"]["summary"] not in summaries:
             parts.append(md(digest["lead"]["summary"], MAX_SUMMARY_CHARS * 2))
         parts.append("")
     parts.append(counts)
-    header = {
+    embeds = [{
         "title": f"📰 Daily AI Report — {format_date(digest['date'])}",
         "color": HEADER_COLOR,
         "description": "\n".join(parts),
-    }
-    if digest["url"]:
-        header["url"] = digest["url"]
-
-    embeds = [header]
+    }]
     for section in digest["sections"]:
         emoji, name, color = SECTION_STYLES.get(section["label"], DEFAULT_STYLE)
-        title = f"{emoji} {name or section['label']}"
-        embeds += section_embeds(
-            title, color, [format_item(i) for i in section["items"]], "\n\n"
-        )
+        section_title = f"{emoji} {name or section['label']}"
+        for index, item in enumerate(section["items"]):
+            embeds.append(story_embed(item, color, section_title if index == 0 else None))
     if digest["flashes"]:
         embeds += section_embeds(
             "⚡ Quick Hits", FLASH_COLOR, [format_flash(i) for i in digest["flashes"]], "\n"
         )
     embeds[-1]["footer"] = {
-        "text": "From AIHOT (aihot.news) · Machine-translated from Chinese, "
+        "text": "Compiled by AIHOT · Machine-translated from Chinese, "
                 "so check the linked originals for exact details"
     }
     return embeds
@@ -309,6 +396,7 @@ def build_embeds(digest):
 def embed_size(embed):
     return (
         len(embed.get("title", ""))
+        + len(embed.get("author", {}).get("name", ""))
         + len(embed.get("description", ""))
         + len(embed.get("footer", {}).get("text", ""))
     )
@@ -379,6 +467,8 @@ def main(argv=None):
         return 0
 
     digest = translate(normalize(report))
+    images = attach_images(digest)
+    print(f"Found images for {images} stories.")
     messages = build_messages(build_embeds(digest))
 
     if args.dry_run:
