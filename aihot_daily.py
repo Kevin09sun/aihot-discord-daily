@@ -2,7 +2,8 @@
 """Post the latest AIHOT daily report to a Discord channel, translated to English.
 
 Uses only the Python standard library. Translation uses Google Translate's free
-web endpoint, which needs no key but is unofficial and could change.
+web endpoint, which needs no key but is unofficial and could change, and falls
+back to the free MyMemory API if Google refuses.
 
 Environment:
   DISCORD_WEBHOOK_URL  target webhook (not needed with --dry-run)
@@ -25,6 +26,7 @@ from pathlib import Path
 
 REPORT_URL = "https://aihot.news/api/v1/dailies/latest"
 TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=zh-CN&tl=en&dt=t"
+MYMEMORY_URL = "https://api.mymemory.translated.net/get"
 USER_AGENT = "aihot-discord-daily/1.0 (private, non-commercial)"
 STATE_FILE = Path(__file__).parent / "state" / "last_posted.txt"
 
@@ -41,7 +43,9 @@ MAX_IMAGE_URL_CHARS = 2000
 MAX_PAGE_BYTES = 1_000_000
 PAGE_TIMEOUT_SECONDS = 15
 MAX_TRANSLATION_INPUT = 2000
-TRANSLATION_PAUSE_SECONDS = 0.2
+MAX_BATCH_CHARS = 4000
+MAX_MYMEMORY_CHARS = 150  # MyMemory allows 500 bytes per request
+TRANSLATION_PAUSE_SECONDS = 1
 
 HEADER_COLOR = 0x5865F2
 FLASH_COLOR = 0xFEE75C
@@ -179,42 +183,123 @@ def parse_google_response(raw):
     return text
 
 
+def make_batches(texts, limit=MAX_BATCH_CHARS):
+    """Group texts so one request can carry many of them."""
+    batches, current, size = [], [], 0
+    for text in texts:
+        if current and size + len(text) + 1 > limit:
+            batches.append(current)
+            current, size = [], 0
+        current.append(text)
+        size += len(text) + 1
+    if current:
+        batches.append(current)
+    return batches
+
+
 def google_translate(text):
-    raw = request("Translation", TRANSLATE_URL, form={"q": text[:MAX_TRANSLATION_INPUT]})
+    raw = request("Google Translate", TRANSLATE_URL, form={"q": text}, attempts=3)
     return parse_google_response(raw)
 
 
-def translate(digest, translator=google_translate, sleep=time.sleep):
-    """Return an English copy of `digest`, using `translator(text) -> english`.
+def split_for_mymemory(text, limit=MAX_MYMEMORY_CHARS):
+    """Split long text at sentence ends, or mid-sentence if there are none nearby."""
+    parts, current = [], ""
+    for sentence in re.findall(r"[^。！？；]+[。！？；]*", text):
+        while len(sentence) > limit:
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(sentence[:limit])
+            sentence = sentence[limit:]
+        if len(current) + len(sentence) > limit:
+            parts.append(current)
+            current = ""
+        current += sentence
+    if current:
+        parts.append(current)
+    return parts
+
+
+def parse_mymemory_response(raw):
+    try:
+        data = json.loads(raw)
+        text = data["responseData"]["translatedText"]
+        status = str(data.get("responseStatus"))
+    except (ValueError, TypeError, KeyError) as err:
+        raise FetchError(f"unexpected MyMemory response: {err}") from None
+    if status != "200" or not text or not text.strip() or "MYMEMORY WARNING" in text:
+        raise FetchError(f"MyMemory refused the request: {status} {str(text)[:120]}")
+    return html.unescape(text)
+
+
+def mymemory_translate(text, sleep=time.sleep):
+    """Translate with MyMemory, whose free tier allows about 5,000 characters a day."""
+    translated = []
+    for part in split_for_mymemory(text):
+        query = urllib.parse.urlencode({"q": part, "langpair": "zh-CN|en"})
+        raw = request("MyMemory", f"{MYMEMORY_URL}?{query}", attempts=2)
+        translated.append(clean(parse_mymemory_response(raw)))
+        sleep(TRANSLATION_PAUSE_SECONDS)
+    return " ".join(translated)
+
+
+def translate_texts(texts, google=google_translate, fallback=mymemory_translate,
+                    sleep=time.sleep):
+    """Translate a list of texts, in order, in as few requests as possible.
+
+    Each text is one line of a batch. If Google returns a different number of
+    lines, or refuses, the affected texts go through the fallback one at a time.
+    """
+    results = {}
+    inputs = [text[:MAX_TRANSLATION_INPUT] for text in texts]
+    try:
+        for batch in make_batches(list(dict.fromkeys(inputs))):
+            lines = google("\n".join(batch)).strip().split("\n")
+            if len(lines) == len(batch):
+                results.update(zip(batch, lines))
+            else:
+                print(f"note: batch returned {len(lines)} of {len(batch)} lines", file=sys.stderr)
+            sleep(TRANSLATION_PAUSE_SECONDS)
+    except FetchError as err:
+        print(f"note: Google Translate unavailable, using MyMemory: {err}", file=sys.stderr)
+    for text in dict.fromkeys(inputs):
+        if text not in results:
+            results[text] = fallback(text)
+    return [results[text] for text in inputs]
+
+
+def translate(digest, translator=translate_texts):
+    """Return an English copy of `digest`, using `translator(texts) -> english texts`.
 
     Text without Chinese is left as is, and repeated text is translated once.
     """
     digest = copy.deepcopy(digest)
-    cache = {}
-
-    def english(text):
-        text = clean(text)
-        if not CJK.search(text):
-            return text
-        if text not in cache:
-            cache[text] = clean(translator(text))
-            sleep(TRANSLATION_PAUSE_SECONDS)
-            if CJK.search(cache[text]):
-                print(f"warning: Chinese left after translating: {text[:60]}", file=sys.stderr)
-        return cache[text]
-
+    fields = []
     if digest["lead"]:
-        for field in ("title", "summary"):
-            digest["lead"][field] = english(digest["lead"][field])
+        fields += [(digest["lead"], "title"), (digest["lead"], "summary")]
     items = list(digest["flashes"])
     for section in digest["sections"]:
         if section["label"] not in SECTION_STYLES:
-            section["label"] = english(section["label"])
+            fields.append((section, "label"))
         items.extend(section["items"])
     for item in items:
-        item["title"] = english(item["title"])
-        item["summary"] = english(item["summary"])
-        item["source"] = english(shorten_source(item["source"]))
+        item["source"] = shorten_source(item["source"])
+        fields += [(item, "title"), (item, "summary"), (item, "source")]
+
+    wanted = list(dict.fromkeys(
+        clean(entry[key]) for entry, key in fields if CJK.search(clean(entry[key]))
+    ))
+    translated = translator(wanted) if wanted else []
+    if len(translated) != len(wanted):
+        raise FetchError(f"translated {len(translated)} of {len(wanted)} texts")
+    english = {text: clean(result) for text, result in zip(wanted, translated)}
+    for text, result in english.items():
+        if CJK.search(result):
+            print(f"warning: Chinese left after translating: {text[:60]}", file=sys.stderr)
+    for entry, key in fields:
+        text = clean(entry[key])
+        entry[key] = english.get(text, text)
     return digest
 
 

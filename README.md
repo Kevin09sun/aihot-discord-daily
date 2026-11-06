@@ -13,7 +13,7 @@ Each report is posted at about 00:17 UTC, shortly after AIHOT publishes it at 00
    gh secret set DISCORD_WEBHOOK_URL -R Kevin09sun/aihot-discord-daily
    ```
 
-Translation uses Google Translate's free web endpoint, so it needs no key or account. The endpoint is unofficial and could change or start blocking requests. If that happens, the run fails rather than posting untranslated text, and GitHub emails you about the failed run.
+Translation needs no key or account. It uses Google Translate's free web endpoint, sending the report in batches to keep requests low. That endpoint is unofficial and can refuse requests, so the free MyMemory API (about 5,000 characters a day) takes over when it does. If both refuse, the run fails rather than posting untranslated text, and GitHub emails you about the failed run.
 
 ## Images and links
 

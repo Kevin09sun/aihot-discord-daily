@@ -23,8 +23,8 @@ def report(items=2, flashes=1, label="模型发布/更新", lead=True):
     }
 
 
-def fake_translator(text):
-    return f"english {text}"
+def fake_translator(texts):
+    return [f"english {text}" for text in texts]
 
 
 def no_sleep(_seconds):
@@ -59,7 +59,7 @@ class NormalizeTests(unittest.TestCase):
 
 class TranslateTests(unittest.TestCase):
     def test_translates_all_text_and_leaves_links_alone(self):
-        digest = a.translate(a.normalize(report()), fake_translator, no_sleep)
+        digest = a.translate(a.normalize(report()), fake_translator)
         item = digest["sections"][0]["items"][0]
         self.assertEqual(item["title"], "english 标题0")
         self.assertEqual(item["summary"], "english 摘要")
@@ -70,35 +70,86 @@ class TranslateTests(unittest.TestCase):
 
     def test_does_not_change_the_input(self):
         digest = a.normalize(report())
-        a.translate(digest, fake_translator, no_sleep)
+        a.translate(digest, fake_translator)
         self.assertEqual(digest["lead"]["title"], "头条")
 
     def test_repeated_text_is_translated_once_and_english_is_skipped(self):
         seen = []
-        def translator(text):
-            seen.append(text)
-            return "english"
+        def translator(texts):
+            seen.extend(texts)
+            return ["english"] * len(texts)
         raw = report(items=3, flashes=0, lead=False)
         raw["sections"][0]["items"][0]["title"] = "Already English"
-        a.translate(a.normalize(raw), translator, no_sleep)
+        a.translate(a.normalize(raw), translator)
         self.assertEqual(seen.count("摘要"), 1)
         self.assertNotIn("Already English", seen)
 
     def test_known_label_is_kept_but_unknown_label_is_translated(self):
-        digest = a.translate(a.normalize(report()), fake_translator, no_sleep)
+        digest = a.translate(a.normalize(report()), fake_translator)
         self.assertEqual(digest["sections"][0]["label"], "模型发布/更新")
-        digest = a.translate(a.normalize(report(label="新版块")), fake_translator, no_sleep)
+        digest = a.translate(a.normalize(report(label="新版块")), fake_translator)
         self.assertEqual(digest["sections"][0]["label"], "english 新版块")
 
     def test_translation_failure_stops_the_run(self):
-        def translator(_text):
+        def translator(_texts):
             raise a.FetchError("blocked")
         with self.assertRaises(a.FetchError):
-            a.translate(a.normalize(report()), translator, no_sleep)
+            a.translate(a.normalize(report()), translator)
 
     def test_leftover_chinese_is_accepted(self):
-        digest = a.translate(a.normalize(report(lead=False)), lambda _: "名字", no_sleep)
+        digest = a.translate(a.normalize(report(lead=False)), lambda texts: ["名字"] * len(texts))
         self.assertEqual(digest["sections"][0]["items"][0]["title"], "名字")
+
+    def test_wrong_number_of_translations_stops_the_run(self):
+        with self.assertRaises(a.FetchError):
+            a.translate(a.normalize(report()), lambda _texts: ["only one"])
+
+    def test_batches_stay_within_the_limit(self):
+        batches = a.make_batches(["字" * 40] * 10, limit=100)
+        self.assertEqual([len(b) for b in batches], [2, 2, 2, 2, 2])
+
+    def test_report_uses_one_google_request_when_batched(self):
+        calls = []
+        def google(text):
+            calls.append(text)
+            return "\n".join(f"line {i}" for i in range(len(text.split("\n"))))
+        result = a.translate_texts(["甲", "乙", "丙"], google, None, no_sleep)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result, ["line 0", "line 1", "line 2"])
+
+    def test_falls_back_when_google_refuses(self):
+        def google(_text):
+            raise a.FetchError("HTTP 429")
+        result = a.translate_texts(["甲", "乙"], google, lambda t: f"backup {t}", no_sleep)
+        self.assertEqual(result, ["backup 甲", "backup 乙"])
+
+    def test_falls_back_when_line_count_differs(self):
+        result = a.translate_texts(["甲", "乙"], lambda _t: "one line", lambda t: f"backup {t}", no_sleep)
+        self.assertEqual(result, ["backup 甲", "backup 乙"])
+
+    def test_fails_when_both_translators_refuse(self):
+        def refuse(_text):
+            raise a.FetchError("refused")
+        with self.assertRaises(a.FetchError):
+            a.translate_texts(["甲"], refuse, refuse, no_sleep)
+
+    def test_split_for_mymemory_respects_limit_and_keeps_text(self):
+        text = "第一句话。" * 50 + "没" * 400
+        parts = a.split_for_mymemory(text)
+        self.assertTrue(all(len(p) <= a.MAX_MYMEMORY_CHARS for p in parts))
+        self.assertTrue(all(p for p in parts))
+        self.assertEqual("".join(parts), text)
+
+    def test_parse_mymemory_response(self):
+        ok = json.dumps({"responseData": {"translatedText": "Hello &amp; bye"}, "responseStatus": 200})
+        self.assertEqual(a.parse_mymemory_response(ok), "Hello & bye")
+        for bad in (
+            "not json",
+            json.dumps({"responseData": {"translatedText": "x"}, "responseStatus": 403}),
+            json.dumps({"responseData": {"translatedText": "MYMEMORY WARNING: USED ALL"}, "responseStatus": 200}),
+        ):
+            with self.assertRaises(a.FetchError):
+                a.parse_mymemory_response(bad)
 
     def test_shorten_source(self):
         cases = {
@@ -169,7 +220,7 @@ class ImageTests(unittest.TestCase):
 
 class FormatTests(unittest.TestCase):
     def english(self, **kwargs):
-        return a.translate(a.normalize(report(**kwargs)), fake_translator, no_sleep)
+        return a.translate(a.normalize(report(**kwargs)), fake_translator)
 
     def test_header_has_title_and_counts_and_no_link(self):
         header = a.build_embeds(self.english())[0]
@@ -208,7 +259,7 @@ class FormatTests(unittest.TestCase):
     def test_story_without_source_link_or_image(self):
         raw = report(items=1, flashes=0)
         del raw["sections"][0]["items"][0]["links"]["original"]
-        card = a.build_embeds(a.translate(a.normalize(raw), fake_translator, no_sleep))[1]
+        card = a.build_embeds(a.translate(a.normalize(raw), fake_translator))[1]
         self.assertNotIn("url", card)
         self.assertNotIn("image", card)
         self.assertIn("*english 来源*", card["description"])
