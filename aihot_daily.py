@@ -96,7 +96,8 @@ def fetch_report():
 
 
 def clean(text, limit=None):
-    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    text = re.sub(r"[\u200b-\u200d\ufeff]", "", str(text or ""))
+    text = re.sub(r"\s+", " ", text).strip()
     if limit and len(text) > limit:
         text = text[: limit - 1].rstrip() + "…"
     return text
@@ -274,7 +275,8 @@ def build_embeds(digest):
     parts = []
     if digest["lead"]:
         parts.append(f"**{md(digest['lead']['title'], MAX_TITLE_CHARS)}**")
-        if digest["lead"]["summary"]:
+        summaries = {i["summary"] for s in digest["sections"] for i in s["items"]}
+        if digest["lead"]["summary"] and digest["lead"]["summary"] not in summaries:
             parts.append(md(digest["lead"]["summary"], MAX_SUMMARY_CHARS * 2))
         parts.append("")
     parts.append(counts)

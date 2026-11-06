@@ -131,6 +131,16 @@ class FormatTests(unittest.TestCase):
         self.assertIn("2 stories · 1 quick hit", embeds[0]["description"])
         self.assertEqual(embeds[1]["title"], "🧠 Model Releases & Updates")
 
+    def test_header_skips_lead_paragraph_repeated_by_a_story(self):
+        digest = self.english()
+        digest["lead"]["summary"] = "unique lead"
+        self.assertIn("unique lead", a.build_embeds(digest)[0]["description"])
+        digest["lead"]["summary"] = digest["sections"][0]["items"][0]["summary"]
+        self.assertNotIn(digest["lead"]["summary"], a.build_embeds(digest)[0]["description"])
+
+    def test_zero_width_characters_are_removed(self):
+        self.assertEqual(a.clean("GPT-6 Cyber \u200b\u200bmodel"), "GPT-6 Cyber model")
+
     def test_item_keeps_source_and_both_links(self):
         text = a.build_embeds(self.english())[1]["description"]
         self.assertIn("(https://example.com/a)", text)
