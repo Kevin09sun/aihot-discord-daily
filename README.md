@@ -1,6 +1,6 @@
 # AIHOT Discord daily
 
-Posts the [AIHOT](https://aihot.news) daily report to a Discord channel each day, translated into English. It runs on GitHub Actions and has no dependencies beyond Python.
+Posts a concise English digest of the [AIHOT](https://aihot.news) daily report to a Discord channel each day. It runs on GitHub Actions and has no dependencies beyond Python.
 
 Each report is posted at about 00:17 UTC, shortly after AIHOT publishes it at 00:00 UTC. A second run at 02:47 UTC acts as a backup and does nothing if the report is already posted. GitHub can start scheduled runs late.
 
@@ -15,9 +15,16 @@ Each report is posted at about 00:17 UTC, shortly after AIHOT publishes it at 00
 
 Translation needs no key or account. It uses Google Translate's free web endpoint, sending the report in batches to keep requests low. That endpoint is unofficial and can refuse requests, so the free MyMemory API (about 5,000 characters a day) takes over when it does. If both refuse, the run fails rather than posting untranslated text, and GitHub emails you about the failed run.
 
-## Images and links
+## What gets posted
 
-Each main story is its own card, showing the preview image its source page publishes. A story goes without an image if the page has none, blocks the request, or only offers an X profile picture. Quick hits stay as a text list. All links go to the original source, never to AIHOT.
+One short message with:
+
+- The top story, with a one-sentence summary
+- One image: the top story's preview image, or the next story that has one, shown on its own card
+- One-line headlines grouped by topic, with long headlines cut to their main clause
+- Up to 5 quick hits (`MAX_QUICK_HITS`)
+
+All links go to the original source, never to AIHOT.
 
 ## Running it manually
 

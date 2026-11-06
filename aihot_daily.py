@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Post the latest AIHOT daily report to a Discord channel, translated to English.
+"""Post a concise English digest of the latest AIHOT daily report to Discord.
 
 Uses only the Python standard library. Translation uses Google Translate's free
 web endpoint, which needs no key but is unofficial and could change, and falls
@@ -35,9 +35,10 @@ STATE_FILE = Path(__file__).parent / "state" / "last_posted.txt"
 MAX_DESCRIPTION = 4000
 MAX_MESSAGE_CHARS = 5800
 MAX_EMBEDS = 10
-MAX_TITLE_CHARS = 240
-MAX_EMBED_TITLE = 256
-MAX_SUMMARY_CHARS = 700
+MAX_HEADLINE_CHARS = 110
+MAX_SUMMARY_CHARS = 220
+MAX_QUICK_HITS = 5
+MAX_IMAGE_TRIES = 5
 MAX_URL_CHARS = 500
 MAX_IMAGE_URL_CHARS = 2000
 MAX_PAGE_BYTES = 1_000_000
@@ -47,16 +48,15 @@ MAX_BATCH_CHARS = 4000
 MAX_MYMEMORY_CHARS = 150  # MyMemory allows 500 bytes per request
 TRANSLATION_PAUSE_SECONDS = 1
 
-HEADER_COLOR = 0x5865F2
-FLASH_COLOR = 0xFEE75C
+EMBED_COLOR = 0x5865F2
 SECTION_STYLES = {
-    "模型发布/更新": ("🧠", "Model Releases & Updates", 0x9B59B6),
-    "产品发布/更新": ("🚀", "Product Launches & Updates", 0x3498DB),
-    "行业动态": ("🏢", "Industry News", 0x2ECC71),
-    "论文研究": ("📄", "Research Papers", 0xE67E22),
-    "技巧与观点": ("💡", "Tips & Opinions", 0x1ABC9C),
+    "模型发布/更新": ("🧠", "Models"),
+    "产品发布/更新": ("🚀", "Products"),
+    "行业动态": ("🏢", "Industry"),
+    "论文研究": ("📄", "Research"),
+    "技巧与观点": ("💡", "Tips & Opinions"),
 }
-DEFAULT_STYLE = ("📌", None, 0x95A5A6)
+DEFAULT_STYLE = ("📌", None)
 AIHOT_HOSTS = ("aihot.news", "aihot.virxact.com")
 
 CJK =re.compile(r"[㐀-鿿豈-﫿]")
@@ -132,10 +132,7 @@ def safe_url(url):
 def normalize_item(raw):
     return {
         "title": clean(raw.get("title")),
-        "summary": clean(raw.get("summary")),
-        "source": clean((raw.get("source") or {}).get("name")),
         "url": safe_url((raw.get("links") or {}).get("original")),
-        "image": "",
     }
 
 
@@ -148,6 +145,7 @@ def normalize(report):
         if items:
             sections.append({"label": clean(section.get("label")), "items": items})
     flashes = [normalize_item(i) for i in report.get("flashes") or [] if i.get("title")]
+    flashes = flashes[:MAX_QUICK_HITS]
     if not sections and not flashes:
         raise FetchError(f"AIHOT report {report.get('date')} has no items")
     return {
@@ -158,18 +156,8 @@ def normalize(report):
         },
         "sections": sections,
         "flashes": flashes,
+        "featured": None,
     }
-
-
-def shorten_source(name):
-    """Reduce a feed name to its publisher, dropping details such as RSS or web.
-
-    "OpenAI：官网动态（RSS）" becomes "OpenAI"; "X：Jane Doe (@jane)" becomes "Jane Doe on X".
-    """
-    match = re.match(r"^X\s*[：:]\s*(.+)$", name)
-    if match:
-        return f"{re.split(r'[（(]', match.group(1))[0].strip()} on X"
-    return re.split(r"[：:（(]", name)[0].strip() or name
 
 
 def parse_google_response(raw):
@@ -283,9 +271,7 @@ def translate(digest, translator=translate_texts):
         if section["label"] not in SECTION_STYLES:
             fields.append((section, "label"))
         items.extend(section["items"])
-    for item in items:
-        item["source"] = shorten_source(item["source"])
-        fields += [(item, "title"), (item, "summary"), (item, "source")]
+    fields += [(item, "title") for item in items]
 
     wanted = list(dict.fromkeys(
         clean(entry[key]) for entry, key in fields if CJK.search(clean(entry[key]))
@@ -362,14 +348,17 @@ def find_image(url):
         return ""
 
 
-def attach_images(digest, finder=find_image):
-    """Add preview images to the main stories. Returns how many were found."""
-    count = 0
-    for section in digest["sections"]:
-        for item in section["items"]:
-            item["image"] = finder(item["url"]) if item["url"] else ""
-            count += bool(item["image"])
-    return count
+def attach_featured_image(digest, finder=find_image):
+    """Feature the first story with an image, trying the top story first."""
+    stories = [item for section in digest["sections"] for item in section["items"]]
+    lead_title = (digest["lead"] or {}).get("title")
+    stories.sort(key=lambda item: item["title"] != lead_title)
+    for item in [s for s in stories if s["url"]][:MAX_IMAGE_TRIES]:
+        image = finder(item["url"])
+        if image:
+            digest["featured"] = {**item, "image": image}
+            return True
+    return False
 
 
 def md(text, limit=None):
@@ -377,35 +366,25 @@ def md(text, limit=None):
     return MARKDOWN.sub(r"\\\1", clean(text, limit))
 
 
-def story_embed(item, color, section_title=None):
-    """Build one story card. Its title and source line link to the original."""
-    title = md(item["title"], MAX_TITLE_CHARS)[:MAX_EMBED_TITLE].rstrip("\\")
-    source = md(item["source"], 100)
-    lines = []
-    if item["summary"]:
-        lines.append(md(item["summary"], MAX_SUMMARY_CHARS))
-    if item["url"]:
-        lines.append(f"🔗 [{source or 'Read the source'}]({item['url']})")
-    elif source:
-        lines.append(f"*{source}*")
-    embed = {"title": title, "color": color}
-    if lines:
-        embed["description"] = "\n\n".join(lines)
-    if item["url"]:
-        embed["url"] = item["url"]
-    if item["image"]:
-        embed["image"] = {"url": item["image"]}
-    if section_title:
-        embed["author"] = {"name": section_title}
-    return embed
+def short_headline(title):
+    """Keep a long headline's main clause, cutting at its first ": " or ", "."""
+    title = clean(title)
+    if len(title) > 70:
+        match = re.search(r": |, ", title[25:])
+        if match:
+            title = title[: 25 + match.start()]
+    return clean(title, MAX_HEADLINE_CHARS)
 
 
-def format_flash(item):
-    title = md(item["title"], MAX_TITLE_CHARS)
-    line = f"• [{title}]({item['url']})" if item["url"] else f"• {title}"
-    if item["source"]:
-        line += f" — *{md(item['source'], 100)}*"
-    return line
+def first_sentence(text):
+    """Return text's first sentence, without stopping at abbreviations like U.S."""
+    match = re.match(r".+?[a-z0-9)\"'%][.!?](?=\s|$)", clean(text))
+    return clean(match.group(0) if match else text, MAX_SUMMARY_CHARS)
+
+
+def headline_line(item):
+    title = md(short_headline(item["title"]))
+    return f"• [{title}]({item['url']})" if item["url"] else f"• {title}"
 
 
 def split_blocks(blocks, separator):
@@ -423,54 +402,57 @@ def split_blocks(blocks, separator):
     return pages
 
 
-def section_embeds(title, color, blocks, separator):
-    pages = split_blocks(blocks, separator)
-    return [
-        {
-            "title": title if i == 0 else f"{title} (continued)",
-            "color": color,
-            "description": page,
-        }
-        for i, page in enumerate(pages)
-    ]
-
-
 def format_date(date):
     day = dt.date.fromisoformat(date)
     return f"{day:%B} {day.day}, {day.year}"
 
 
 def build_embeds(digest):
-    stories = sum(len(s["items"]) for s in digest["sections"])
-    counts = f"{stories} {'story' if stories == 1 else 'stories'}"
-    hits = len(digest["flashes"])
-    if hits:
-        counts += f" · {hits} quick {'hit' if hits == 1 else 'hits'}"
+    lead, featured = digest["lead"], digest["featured"]
     links = {i["title"]: i["url"] for s in digest["sections"] for i in s["items"]}
-    summaries = {i["summary"] for s in digest["sections"] for i in s["items"]}
-    parts = []
-    if digest["lead"]:
-        lead_title = md(digest["lead"]["title"], MAX_TITLE_CHARS)
-        lead_url = links.get(digest["lead"]["title"])
-        parts.append(f"**[{lead_title}]({lead_url})**" if lead_url else f"**{lead_title}**")
-        if digest["lead"]["summary"] and digest["lead"]["summary"] not in summaries:
-            parts.append(md(digest["lead"]["summary"], MAX_SUMMARY_CHARS * 2))
-        parts.append("")
-    parts.append(counts)
-    embeds = [{
+    shown = set()
+    header = {
         "title": f"📰 Daily AI Report — {format_date(digest['date'])}",
-        "color": HEADER_COLOR,
-        "description": "\n".join(parts),
-    }]
+        "color": EMBED_COLOR,
+    }
+    if lead:
+        shown.add(lead["title"])
+        title = md(short_headline(lead["title"]))
+        url = links.get(lead["title"])
+        parts = [f"**[{title}]({url})**" if url else f"**{title}**"]
+        if lead["summary"]:
+            parts.append(md(first_sentence(lead["summary"])))
+        header["description"] = "\n".join(parts)
+    embeds = [header]
+
+    if featured:
+        if lead and featured["title"] == lead["title"]:
+            header["image"] = {"url": featured["image"]}
+        else:
+            shown.add(featured["title"])
+            embeds.append({
+                "title": f"📸 {md(short_headline(featured['title']))}",
+                "color": EMBED_COLOR,
+                "url": featured["url"],
+                "image": {"url": featured["image"]},
+            })
+
+    lines = []
     for section in digest["sections"]:
-        emoji, name, color = SECTION_STYLES.get(section["label"], DEFAULT_STYLE)
-        section_title = f"{emoji} {name or section['label']}"
-        for index, item in enumerate(section["items"]):
-            embeds.append(story_embed(item, color, section_title if index == 0 else None))
+        items = [i for i in section["items"] if i["title"] not in shown]
+        if items:
+            emoji, name = SECTION_STYLES.get(section["label"], DEFAULT_STYLE)
+            lines += [""] if lines else []
+            lines.append(f"**{emoji} {name or md(section['label'])}**")
+            lines += [headline_line(i) for i in items]
     if digest["flashes"]:
-        embeds += section_embeds(
-            "⚡ Quick Hits", FLASH_COLOR, [format_flash(i) for i in digest["flashes"]], "\n"
-        )
+        lines += [""] if lines else []
+        lines.append("**⚡ Also**")
+        lines += [headline_line(i) for i in digest["flashes"]]
+    for index, page in enumerate(split_blocks(lines, "\n")):
+        title = "🗞️ Headlines" if index == 0 else "🗞️ Headlines (continued)"
+        embeds.append({"title": title, "color": EMBED_COLOR, "description": page.strip()})
+
     embeds[-1]["footer"] = {
         "text": "Compiled by AIHOT · Machine-translated from Chinese, "
                 "so check the linked originals for exact details"
@@ -481,7 +463,6 @@ def build_embeds(digest):
 def embed_size(embed):
     return (
         len(embed.get("title", ""))
-        + len(embed.get("author", {}).get("name", ""))
         + len(embed.get("description", ""))
         + len(embed.get("footer", {}).get("text", ""))
     )
@@ -552,8 +533,7 @@ def main(argv=None):
         return 0
 
     digest = translate(normalize(report))
-    images = attach_images(digest)
-    print(f"Found images for {images} stories.")
+    print(f"Featured image found: {attach_featured_image(digest)}")
     messages = build_messages(build_embeds(digest))
 
     if args.dry_run:

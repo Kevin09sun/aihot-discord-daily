@@ -6,18 +6,18 @@ from pathlib import Path
 import aihot_daily as a
 
 
-def raw_item(n, title="标题", summary="摘要", original="https://example.com/a"):
+def raw_item(n, title="标题", original="https://example.com/a"):
     links = {"aihot": f"https://aihot.news/items/{n}"}
     if original:
-        links["original"] = original
-    return {"title": f"{title}{n}", "summary": summary, "source": {"name": "来源"}, "links": links}
+        links["original"] = f"{original}{n}"
+    return {"title": f"{title}{n}", "summary": "摘要", "source": {"name": "来源"}, "links": links}
 
 
 def report(items=2, flashes=1, label="模型发布/更新", lead=True):
     return {
         "date": "2026-11-06",
         "links": {"aihot": "https://aihot.news/daily/2026-11-06"},
-        "lead": {"title": "头条", "leadParagraph": "导语"} if lead else None,
+        "lead": {"title": "标题0", "leadParagraph": "导语"} if lead else None,
         "sections": [{"label": label, "items": [raw_item(i) for i in range(items)]}],
         "flashes": [raw_item(f"f{i}") for i in range(flashes)],
     }
@@ -31,23 +31,31 @@ def no_sleep(_seconds):
     pass
 
 
+def english(**kwargs):
+    return a.translate(a.normalize(report(**kwargs)), fake_translator)
+
+
 class NormalizeTests(unittest.TestCase):
     def test_uses_original_link_only(self):
         item = a.normalize(report())["sections"][0]["items"][0]
-        self.assertEqual(item["url"], "https://example.com/a")
-        self.assertNotIn("aihot", item)
+        self.assertEqual(item, {"title": "标题0", "url": "https://example.com/a0"})
 
     def test_no_link_without_original(self):
         self.assertEqual(a.normalize_item(raw_item(1, original=None))["url"], "")
 
-    def test_rejects_aihot_links(self):
-        for url in ("https://aihot.news/items/1", "https://www.aihot.news/x", "https://aihot.virxact.com/x"):
+    def test_rejects_aihot_and_non_https_links(self):
+        for url in (
+            "https://aihot.news/items/1",
+            "https://www.aihot.news/x",
+            "https://aihot.virxact.com/x",
+            "javascript:alert(1)",
+            "http://example.com",
+        ):
             self.assertEqual(a.safe_url(url), "")
         self.assertEqual(a.safe_url("https://notaihot.news/x"), "https://notaihot.news/x")
 
-    def test_rejects_non_https_links(self):
-        self.assertEqual(a.safe_url("javascript:alert(1)"), "")
-        self.assertEqual(a.safe_url("http://example.com"), "")
+    def test_quick_hits_are_capped(self):
+        self.assertEqual(len(a.normalize(report(flashes=9))["flashes"]), a.MAX_QUICK_HITS)
 
     def test_null_lead_is_allowed(self):
         self.assertIsNone(a.normalize(report(lead=False))["lead"])
@@ -58,37 +66,35 @@ class NormalizeTests(unittest.TestCase):
 
 
 class TranslateTests(unittest.TestCase):
-    def test_translates_all_text_and_leaves_links_alone(self):
-        digest = a.translate(a.normalize(report()), fake_translator)
+    def test_translates_used_text_and_leaves_links_alone(self):
+        digest = english()
         item = digest["sections"][0]["items"][0]
         self.assertEqual(item["title"], "english 标题0")
-        self.assertEqual(item["summary"], "english 摘要")
-        self.assertEqual(item["source"], "english 来源")
-        self.assertEqual(item["url"], "https://example.com/a")
+        self.assertEqual(item["url"], "https://example.com/a0")
         self.assertEqual(digest["lead"]["summary"], "english 导语")
         self.assertEqual(digest["flashes"][0]["title"], "english 标题f0")
 
     def test_does_not_change_the_input(self):
         digest = a.normalize(report())
         a.translate(digest, fake_translator)
-        self.assertEqual(digest["lead"]["title"], "头条")
+        self.assertEqual(digest["lead"]["title"], "标题0")
 
-    def test_repeated_text_is_translated_once_and_english_is_skipped(self):
+    def test_repeated_text_is_sent_once_and_unused_text_is_not_sent(self):
         seen = []
         def translator(texts):
             seen.extend(texts)
             return ["english"] * len(texts)
-        raw = report(items=3, flashes=0, lead=False)
-        raw["sections"][0]["items"][0]["title"] = "Already English"
+        raw = report(items=3, flashes=0)
+        raw["sections"][0]["items"][1]["title"] = "Already English"
         a.translate(a.normalize(raw), translator)
-        self.assertEqual(seen.count("摘要"), 1)
+        self.assertEqual(seen.count("标题0"), 1)
         self.assertNotIn("Already English", seen)
+        self.assertNotIn("摘要", seen)
+        self.assertNotIn("来源", seen)
 
     def test_known_label_is_kept_but_unknown_label_is_translated(self):
-        digest = a.translate(a.normalize(report()), fake_translator)
-        self.assertEqual(digest["sections"][0]["label"], "模型发布/更新")
-        digest = a.translate(a.normalize(report(label="新版块")), fake_translator)
-        self.assertEqual(digest["sections"][0]["label"], "english 新版块")
+        self.assertEqual(english()["sections"][0]["label"], "模型发布/更新")
+        self.assertEqual(english(label="新版块")["sections"][0]["label"], "english 新版块")
 
     def test_translation_failure_stops_the_run(self):
         def translator(_texts):
@@ -96,13 +102,13 @@ class TranslateTests(unittest.TestCase):
         with self.assertRaises(a.FetchError):
             a.translate(a.normalize(report()), translator)
 
-    def test_leftover_chinese_is_accepted(self):
-        digest = a.translate(a.normalize(report(lead=False)), lambda texts: ["名字"] * len(texts))
-        self.assertEqual(digest["sections"][0]["items"][0]["title"], "名字")
-
     def test_wrong_number_of_translations_stops_the_run(self):
         with self.assertRaises(a.FetchError):
             a.translate(a.normalize(report()), lambda _texts: ["only one"])
+
+    def test_leftover_chinese_is_accepted(self):
+        digest = a.translate(a.normalize(report(lead=False)), lambda texts: ["名字"] * len(texts))
+        self.assertEqual(digest["sections"][0]["items"][0]["title"], "名字")
 
     def test_batches_stay_within_the_limit(self):
         batches = a.make_batches(["字" * 40] * 10, limit=100)
@@ -136,8 +142,7 @@ class TranslateTests(unittest.TestCase):
     def test_split_for_mymemory_respects_limit_and_keeps_text(self):
         text = "第一句话。" * 50 + "没" * 400
         parts = a.split_for_mymemory(text)
-        self.assertTrue(all(len(p) <= a.MAX_MYMEMORY_CHARS for p in parts))
-        self.assertTrue(all(p for p in parts))
+        self.assertTrue(all(0 < len(p) <= a.MAX_MYMEMORY_CHARS for p in parts))
         self.assertEqual("".join(parts), text)
 
     def test_parse_mymemory_response(self):
@@ -150,19 +155,6 @@ class TranslateTests(unittest.TestCase):
         ):
             with self.assertRaises(a.FetchError):
                 a.parse_mymemory_response(bad)
-
-    def test_shorten_source(self):
-        cases = {
-            "OpenAI：官网动态（RSS · 排除企业/客户案例）": "OpenAI",
-            "Meta：Newsroom · AI（RSS）": "Meta",
-            "Goodfire Research（网页）": "Goodfire Research",
-            "Reflection Blog": "Reflection Blog",
-            "X：Tibo (@thsottiaux)": "Tibo on X",
-            "X：Mustafa Suleyman（Microsoft AI CEO） (@mustafasuleyman)": "Mustafa Suleyman on X",
-            "Xcode：Blog": "Xcode",
-        }
-        for name, expected in cases.items():
-            self.assertEqual(a.shorten_source(name), expected)
 
     def test_parse_google_response_joins_segments(self):
         raw = json.dumps([[["Hello. ", "你好。"], ["World", "世界"]], None, "zh-CN"])
@@ -210,89 +202,144 @@ class ImageTests(unittest.TestCase):
     def test_network_failure_means_no_image(self):
         self.assertEqual(a.find_image("https://nonexistent.invalid/"), "")
 
-    def test_attach_images_covers_stories_only(self):
-        digest = a.normalize(report(items=2, flashes=1))
-        count = a.attach_images(digest, lambda url: "https://cdn.example.com/i.png")
-        self.assertEqual(count, 2)
-        self.assertEqual(digest["sections"][0]["items"][0]["image"], "https://cdn.example.com/i.png")
-        self.assertEqual(digest["flashes"][0]["image"], "")
+    def test_top_story_image_is_tried_first(self):
+        raw = report(items=3)
+        raw["lead"]["title"] = "标题2"
+        digest = a.normalize(raw)
+        tried = []
+        def finder(url):
+            tried.append(url)
+            return "https://cdn.example.com/i.png"
+        self.assertTrue(a.attach_featured_image(digest, finder))
+        self.assertEqual(tried, ["https://example.com/a2"])
+        self.assertEqual(digest["featured"]["title"], "标题2")
+
+    def test_falls_through_to_next_story_with_an_image(self):
+        digest = a.normalize(report(items=3))
+        a.attach_featured_image(
+            digest, lambda url: "https://cdn.example.com/i.png" if url.endswith("a1") else ""
+        )
+        self.assertEqual(digest["featured"]["title"], "标题1")
+
+    def test_no_images_anywhere(self):
+        digest = a.normalize(report(items=2))
+        self.assertFalse(a.attach_featured_image(digest, lambda _url: ""))
+        self.assertIsNone(digest["featured"])
+
+    def test_tries_are_limited(self):
+        tried = []
+        def finder(url):
+            tried.append(url)
+            return ""
+        a.attach_featured_image(a.normalize(report(items=20)), finder)
+        self.assertEqual(len(tried), a.MAX_IMAGE_TRIES)
 
 
 class FormatTests(unittest.TestCase):
-    def english(self, **kwargs):
-        return a.translate(a.normalize(report(**kwargs)), fake_translator)
+    def test_short_headline_keeps_main_clause(self):
+        self.assertEqual(
+            a.short_headline("Thinking Machines Lab releases Inkling 2 Small: 594B parameter MoE model, with weights next week"),
+            "Thinking Machines Lab releases Inkling 2 Small",
+        )
 
-    def test_header_has_title_and_counts_and_no_link(self):
-        header = a.build_embeds(self.english())[0]
+    def test_short_headline_keeps_short_or_leading_colon_titles(self):
+        short = "OpenAI releases GPT-6 Cyber network security model"
+        self.assertEqual(a.short_headline(short), short)
+        title = "a16z: Vulnerability exploitation used to be a bottleneck, but AI has reduced attack costs"
+        self.assertEqual(a.short_headline(title), "a16z: Vulnerability exploitation used to be a bottleneck")
+
+    def test_short_headline_has_a_length_limit(self):
+        self.assertLessEqual(len(a.short_headline("word " * 100)), a.MAX_HEADLINE_CHARS)
+
+    def test_first_sentence(self):
+        self.assertEqual(a.first_sentence("Stocks fell. Then they rose."), "Stocks fell.")
+        self.assertEqual(a.first_sentence("The U.S. market fell 5%. More."), "The U.S. market fell 5%.")
+        self.assertEqual(a.first_sentence("No full stop here"), "No full stop here")
+        self.assertLessEqual(len(a.first_sentence("word " * 200)), a.MAX_SUMMARY_CHARS)
+
+    def test_header_shows_top_story_with_link_and_one_sentence(self):
+        digest = english()
+        digest["lead"]["summary"] = "First sentence. Second sentence."
+        header = a.build_embeds(digest)[0]
         self.assertEqual(header["title"], "📰 Daily AI Report — November 6, 2026")
-        self.assertIn("2 stories · 1 quick hit", header["description"])
+        self.assertIn("[english 标题0](https://example.com/a0)", header["description"])
+        self.assertIn("First sentence.", header["description"])
+        self.assertNotIn("Second sentence.", header["description"])
         self.assertNotIn("url", header)
 
-    def test_lead_links_to_matching_story_source(self):
-        digest = self.english()
-        digest["lead"]["title"] = digest["sections"][0]["items"][0]["title"]
-        self.assertIn("(https://example.com/a)", a.build_embeds(digest)[0]["description"])
+    def test_top_story_image_goes_in_the_header_and_is_not_repeated(self):
+        digest = english()
+        digest["featured"] = {**digest["sections"][0]["items"][0], "image": "https://cdn.example.com/i.png"}
+        embeds = a.build_embeds(digest)
+        self.assertEqual(embeds[0]["image"], {"url": "https://cdn.example.com/i.png"})
+        self.assertEqual(len(embeds), 2)
+        self.assertNotIn("english 标题0", embeds[1]["description"])
 
-    def test_header_skips_lead_paragraph_repeated_by_a_story(self):
-        digest = self.english()
-        digest["lead"]["summary"] = "unique lead"
-        self.assertIn("unique lead", a.build_embeds(digest)[0]["description"])
-        digest["lead"]["summary"] = digest["sections"][0]["items"][0]["summary"]
-        self.assertNotIn(digest["lead"]["summary"], a.build_embeds(digest)[0]["description"])
+    def test_other_story_image_gets_its_own_card_and_is_not_repeated(self):
+        digest = english()
+        digest["featured"] = {**digest["sections"][0]["items"][1], "image": "https://cdn.example.com/i.png"}
+        embeds = a.build_embeds(digest)
+        self.assertNotIn("image", embeds[0])
+        self.assertEqual(embeds[1]["title"], "📸 english 标题1")
+        self.assertEqual(embeds[1]["url"], "https://example.com/a1")
+        self.assertEqual(embeds[1]["image"], {"url": "https://cdn.example.com/i.png"})
+        self.assertNotIn("english 标题1", embeds[2]["description"])
 
-    def test_zero_width_characters_are_removed(self):
-        self.assertEqual(a.clean("GPT-6 Cyber \u200b\u200bmodel"), "GPT-6 Cyber model")
+    def test_headlines_are_grouped_and_linked(self):
+        text = a.build_embeds(english(items=2, flashes=1))[1]["description"]
+        self.assertIn("**🧠 Models**", text)
+        self.assertIn("• [english 标题1](https://example.com/a1)", text)
+        self.assertIn("**⚡ Also**", text)
+        self.assertIn("• [english 标题f0](https://example.com/af0)", text)
 
-    def test_story_card_links_to_source_and_shows_image(self):
-        digest = self.english()
-        digest["sections"][0]["items"][0]["image"] = "https://cdn.example.com/i.png"
-        card = a.build_embeds(digest)[1]
-        self.assertEqual(card["url"], "https://example.com/a")
-        self.assertEqual(card["image"], {"url": "https://cdn.example.com/i.png"})
-        self.assertIn("🔗 [english 来源](https://example.com/a)", card["description"])
+    def test_headline_without_source_has_no_link(self):
+        self.assertEqual(a.headline_line({"title": "Plain", "url": ""}), "• Plain")
 
-    def test_section_name_appears_once_per_section(self):
-        embeds = a.build_embeds(self.english())
-        self.assertEqual(embeds[1]["author"], {"name": "🧠 Model Releases & Updates"})
-        self.assertNotIn("author", embeds[2])
+    def test_section_emptied_by_top_story_is_dropped(self):
+        embeds = a.build_embeds(english(items=1, flashes=1))
+        self.assertNotIn("Models", embeds[1]["description"])
 
-    def test_story_without_source_link_or_image(self):
-        raw = report(items=1, flashes=0)
-        del raw["sections"][0]["items"][0]["links"]["original"]
-        card = a.build_embeds(a.translate(a.normalize(raw), fake_translator))[1]
-        self.assertNotIn("url", card)
-        self.assertNotIn("image", card)
-        self.assertIn("*english 来源*", card["description"])
+    def test_report_with_only_a_top_story_still_has_a_footer(self):
+        embeds = a.build_embeds(english(items=1, flashes=0))
+        self.assertEqual(len(embeds), 1)
+        self.assertIn("footer", embeds[0])
+
+    def test_report_without_lead(self):
+        embeds = a.build_embeds(english(lead=False))
+        self.assertNotIn("description", embeds[0])
+        self.assertIn("english 标题0", embeds[1]["description"])
 
     def test_payload_never_links_to_aihot(self):
-        digest = self.english(items=3, flashes=3)
+        digest = english(items=3, flashes=3)
         payload = json.dumps(a.build_messages(a.build_embeds(digest)), ensure_ascii=False)
         self.assertNotIn("aihot.news", payload)
         self.assertNotIn("[AIHOT]", payload)
 
     def test_last_embed_credits_source_and_discloses_translation(self):
-        footer = a.build_embeds(self.english())[-1]["footer"]["text"]
+        footer = a.build_embeds(english())[-1]["footer"]["text"]
         self.assertIn("AIHOT", footer)
         self.assertIn("Machine-translated", footer)
 
     def test_markdown_links_in_text_are_neutralized(self):
-        item = {"title": "t", "summary": "[x](https://evil.example) **hi**", "source": "",
-                "url": "https://example.com", "image": ""}
-        text = a.story_embed(item, 0)["description"]
-        self.assertNotIn("[x](", text)
-        self.assertIn("\\[x\\]", text)
-        self.assertIn("\\*\\*hi\\*\\*", text)
+        line = a.headline_line({"title": "[x](https://evil.example) **hi**", "url": "https://example.com"})
+        self.assertNotIn("[x](", line)
+        self.assertIn("\\[x\\]", line)
+        self.assertIn("\\*\\*hi\\*\\*", line)
+
+    def test_zero_width_characters_are_removed(self):
+        self.assertEqual(a.clean("GPT-6 Cyber \u200b\u200bmodel"), "GPT-6 Cyber model")
 
     def test_messages_disable_all_mentions(self):
-        for message in a.build_messages(a.build_embeds(self.english())):
+        for message in a.build_messages(a.build_embeds(english())):
             self.assertEqual(message["allowed_mentions"], {"parse": []})
 
-    def test_large_report_respects_discord_limits(self):
-        digest = self.english(items=120, flashes=120)
-        for section in digest["sections"]:
-            for item in section["items"]:
-                item["title"] = "_" * 400
-                item["summary"] = "word " * 200
+    def test_typical_report_fits_one_message(self):
+        digest = english(items=12, flashes=10)
+        digest["featured"] = {**digest["sections"][0]["items"][1], "image": "https://cdn.example.com/i.png"}
+        self.assertEqual(len(a.build_messages(a.build_embeds(digest))), 1)
+
+    def test_huge_report_respects_discord_limits(self):
+        digest = english(items=400, flashes=5)
         messages = a.build_messages(a.build_embeds(digest))
         self.assertGreater(len(messages), 1)
         for message in messages:
@@ -301,8 +348,6 @@ class FormatTests(unittest.TestCase):
             for embed in message["embeds"]:
                 self.assertLessEqual(len(embed.get("description", "")), 4096)
                 self.assertLessEqual(len(embed["title"]), 256)
-        titles = [e["title"] for m in messages for e in m["embeds"]]
-        self.assertIn("⚡ Quick Hits (continued)", titles)
 
 
 class StateTests(unittest.TestCase):
