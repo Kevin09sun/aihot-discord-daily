@@ -38,7 +38,8 @@ MAX_EMBEDS = 10
 MAX_HEADLINE_CHARS = 110
 MAX_SUMMARY_CHARS = 220
 MAX_QUICK_HITS = 5
-MAX_IMAGE_TRIES = 5
+MAX_GALLERY_IMAGES = 4  # Discord shows up to 4 images as one grid
+MAX_IMAGE_TRIES = 10
 MAX_URL_CHARS = 500
 MAX_IMAGE_URL_CHARS = 2000
 MAX_PAGE_BYTES = 1_000_000
@@ -156,7 +157,7 @@ def normalize(report):
         },
         "sections": sections,
         "flashes": flashes,
-        "featured": None,
+        "gallery": [],
     }
 
 
@@ -304,7 +305,8 @@ def usable_image(url):
         return False
     except ValueError:
         pass
-    return "/profile_images/" not in url
+    path = urllib.parse.urlsplit(url).path.lower()
+    return "/profile_images/" not in path and "logo" not in path
 
 
 def parse_preview_image(page, base_url):
@@ -348,17 +350,23 @@ def find_image(url):
         return ""
 
 
-def attach_featured_image(digest, finder=find_image):
-    """Feature the first story with an image, trying the top story first."""
+def attach_gallery(digest, finder=find_image):
+    """Collect up to 4 story images, trying the top story first, then the
+    other stories in report order, then quick hits. Returns how many were found."""
     stories = [item for section in digest["sections"] for item in section["items"]]
     lead_title = (digest["lead"] or {}).get("title")
     stories.sort(key=lambda item: item["title"] != lead_title)
-    for item in [s for s in stories if s["url"]][:MAX_IMAGE_TRIES]:
+    candidates = [i for i in stories + digest["flashes"] if i["url"]][:MAX_IMAGE_TRIES]
+    digest["gallery"] = []
+    seen_images = set()
+    for item in candidates:
+        if len(digest["gallery"]) >= MAX_GALLERY_IMAGES:
+            break
         image = finder(item["url"])
-        if image:
-            digest["featured"] = {**item, "image": image}
-            return True
-    return False
+        if image and image not in seen_images:
+            seen_images.add(image)
+            digest["gallery"].append({**item, "image": image})
+    return len(digest["gallery"])
 
 
 def md(text, limit=None):
@@ -408,7 +416,7 @@ def format_date(date):
 
 
 def build_embeds(digest):
-    lead, featured = digest["lead"], digest["featured"]
+    lead, gallery = digest["lead"], digest["gallery"]
     links = {i["title"]: i["url"] for s in digest["sections"] for i in s["items"]}
     shown = set()
     header = {
@@ -425,17 +433,20 @@ def build_embeds(digest):
         header["description"] = "\n".join(parts)
     embeds = [header]
 
-    if featured:
-        if lead and featured["title"] == lead["title"]:
-            header["image"] = {"url": featured["image"]}
-        else:
-            shown.add(featured["title"])
-            embeds.append({
-                "title": f"📸 {md(short_headline(featured['title']))}",
-                "color": EMBED_COLOR,
-                "url": featured["url"],
-                "image": {"url": featured["image"]},
-            })
+    if gallery:
+        # Embeds sharing a url are shown by Discord as one card with an image grid.
+        captions = [
+            f"{n}. [{md(short_headline(item['title']))}]({item['url']})"
+            for n, item in enumerate(gallery, 1)
+        ]
+        embeds.append({
+            "title": "📸 In pictures",
+            "color": EMBED_COLOR,
+            "url": gallery[0]["url"],
+            "description": "\n".join(captions),
+            "image": {"url": gallery[0]["image"]},
+        })
+        embeds += [{"url": gallery[0]["url"], "image": {"url": i["image"]}} for i in gallery[1:]]
 
     lines = []
     for section in digest["sections"]:
@@ -533,7 +544,7 @@ def main(argv=None):
         return 0
 
     digest = translate(normalize(report))
-    print(f"Featured image found: {attach_featured_image(digest)}")
+    print(f"Images found: {attach_gallery(digest)}")
     messages = build_messages(build_embeds(digest))
 
     if args.dry_run:

@@ -20,7 +20,7 @@ Translation needs no key or account. It uses Google Translate's free web endpoin
 One short message with:
 
 - The top story, with a one-sentence summary
-- One image: the top story's preview image, or the next story that has one, shown on its own card
+- Up to 4 images in one grid card, with numbered captions linking to each story. Images are the preview images source pages publish, often screenshots attached to X posts. Logos and profile pictures are skipped.
 - One-line headlines grouped by topic, with long headlines cut to their main clause
 - Up to 5 quick hits (`MAX_QUICK_HITS`)
 
