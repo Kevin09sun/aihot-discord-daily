@@ -332,12 +332,11 @@ class FormatTests(unittest.TestCase):
     def test_payload_never_links_to_aihot(self):
         digest = english(items=3, flashes=3)
         payload = json.dumps(a.build_messages(a.build_embeds(digest)), ensure_ascii=False)
-        self.assertNotIn("aihot.news", payload)
-        self.assertNotIn("[AIHOT]", payload)
+        self.assertNotIn("aihot", payload.lower())
+        self.assertNotIn("virxact", payload.lower())
 
-    def test_last_embed_credits_source_and_discloses_translation(self):
+    def test_last_embed_discloses_translation(self):
         footer = a.build_embeds(english())[-1]["footer"]["text"]
-        self.assertIn("AIHOT", footer)
         self.assertIn("Machine-translated", footer)
 
     def test_markdown_links_in_text_are_neutralized(self):

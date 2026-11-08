@@ -24,7 +24,7 @@ One short message with:
 - One-line headlines grouped by topic, with long headlines cut to their main clause
 - Up to 5 quick hits (`MAX_QUICK_HITS`)
 
-All links go to the original source, never to AIHOT.
+All links go to the original source, never to AIHOT, and the posted report doesn't mention AIHOT by name.
 
 ## Running it manually
 

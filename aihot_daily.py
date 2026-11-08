@@ -465,7 +465,7 @@ def build_embeds(digest):
         embeds.append({"title": title, "color": EMBED_COLOR, "description": page.strip()})
 
     embeds[-1]["footer"] = {
-        "text": "Compiled by AIHOT · Machine-translated from Chinese, "
+        "text": "Machine-translated from Chinese, "
                 "so check the linked originals for exact details"
     }
     return embeds
