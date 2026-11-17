@@ -17,12 +17,13 @@ Translation needs no key or account. It uses Google Translate's free web endpoin
 
 ## What gets posted
 
-One short message with:
+One compact message:
 
 - The top story, with a one-sentence summary
-- Up to 4 images in one grid card, with numbered captions linking to each story. Images are the preview images source pages publish, often screenshots attached to X posts. Logos and profile pictures are skipped.
-- One-line headlines grouped by topic, with long headlines cut to their main clause
+- One-line headlines grouped by topic, with long headlines cut to their main clause. Each story appears only once, and quick hits that repeat an already-listed headline are dropped.
 - Up to 5 quick hits (`MAX_QUICK_HITS`)
+
+The message is only split when a very long report needs more room. There are no images: preview images from source pages were usually irrelevant and made the post much longer.
 
 All links go to the original source, never to AIHOT, and the posted report doesn't mention AIHOT by name.
 

@@ -64,6 +64,9 @@ class NormalizeTests(unittest.TestCase):
         with self.assertRaises(a.FetchError):
             a.normalize(report(items=0, flashes=0))
 
+    def test_digest_has_no_gallery(self):
+        self.assertNotIn("gallery", a.normalize(report()))
+
 
 class TranslateTests(unittest.TestCase):
     def test_translates_used_text_and_leaves_links_alone(self):
@@ -166,85 +169,6 @@ class TranslateTests(unittest.TestCase):
                 a.parse_google_response(raw)
 
 
-class ImageTests(unittest.TestCase):
-    def test_finds_og_image_in_either_attribute_order(self):
-        for tag in (
-            b'<meta property="og:image" content="https://cdn.example.com/a.png">',
-            b"<meta content='https://cdn.example.com/a.png' property='og:image' />",
-        ):
-            self.assertEqual(
-                a.parse_preview_image(tag, "https://example.com/post"),
-                "https://cdn.example.com/a.png",
-            )
-
-    def test_falls_back_to_twitter_image_and_resolves_relative_urls(self):
-        page = b'<meta name="twitter:image" content="/img/a.png?x=1&amp;y=2">'
-        self.assertEqual(
-            a.parse_preview_image(page, "https://example.com/post"),
-            "https://example.com/img/a.png?x=1&y=2",
-        )
-
-    def test_page_without_image_returns_nothing(self):
-        self.assertEqual(a.parse_preview_image(b"<html></html>", "https://example.com"), "")
-
-    def test_rejects_unusable_images(self):
-        for url in (
-            "https://localhost/a.png",
-            "http://example.com/a.png",
-            "https://127.0.0.1/a.png",
-            "https://pbs.twimg.com/profile_images/1/a_400x400.jpg",
-            "https://aihot.news/a.png",
-            "https://example.com/a b.png",
-        ):
-            self.assertFalse(a.usable_image(url), url)
-        self.assertTrue(a.usable_image("https://pbs.twimg.com/media/abc?format=webp"))
-
-    def test_network_failure_means_no_image(self):
-        self.assertEqual(a.find_image("https://nonexistent.invalid/"), "")
-
-    def test_rejects_logos(self):
-        self.assertFalse(a.usable_image("https://metr.org/assets/images/logo/og-image-logo.png"))
-
-    def test_top_story_image_comes_first(self):
-        raw = report(items=3, flashes=0)
-        raw["lead"]["title"] = "标题2"
-        digest = a.normalize(raw)
-        count = a.attach_gallery(digest, lambda url: f"https://cdn.example.com/{url[-2:]}.png")
-        self.assertEqual(count, 3)
-        self.assertEqual([g["title"] for g in digest["gallery"]], ["标题2", "标题0", "标题1"])
-
-    def test_quick_hits_fill_the_gallery_after_stories(self):
-        digest = a.normalize(report(items=1, flashes=5))
-        a.attach_gallery(digest, lambda url: f"https://cdn.example.com/{url[-3:]}.png")
-        self.assertEqual(len(digest["gallery"]), a.MAX_GALLERY_IMAGES)
-        self.assertEqual(digest["gallery"][1]["title"], "标题f0")
-
-    def test_stories_without_images_are_skipped(self):
-        digest = a.normalize(report(items=3))
-        a.attach_gallery(
-            digest, lambda url: "https://cdn.example.com/i.png" if url.endswith("a1") else ""
-        )
-        self.assertEqual([g["title"] for g in digest["gallery"]], ["标题1"])
-
-    def test_duplicate_images_are_skipped(self):
-        digest = a.normalize(report(items=3))
-        a.attach_gallery(digest, lambda _url: "https://cdn.example.com/same.png")
-        self.assertEqual(len(digest["gallery"]), 1)
-
-    def test_no_images_anywhere(self):
-        digest = a.normalize(report(items=2))
-        self.assertEqual(a.attach_gallery(digest, lambda _url: ""), 0)
-        self.assertEqual(digest["gallery"], [])
-
-    def test_tries_are_limited(self):
-        tried = []
-        def finder(url):
-            tried.append(url)
-            return ""
-        a.attach_gallery(a.normalize(report(items=20)), finder)
-        self.assertEqual(len(tried), a.MAX_IMAGE_TRIES)
-
-
 class FormatTests(unittest.TestCase):
     def test_short_headline_keeps_main_clause(self):
         self.assertEqual(
@@ -277,47 +201,27 @@ class FormatTests(unittest.TestCase):
         self.assertNotIn("Second sentence.", header["description"])
         self.assertNotIn("url", header)
 
-    def gallery_digest(self, count):
-        digest = english(items=4, flashes=1)
-        digest["gallery"] = [
-            {**item, "image": f"https://cdn.example.com/{n}.png"}
-            for n, item in enumerate(digest["sections"][0]["items"][:count])
-        ]
-        return digest
-
-    def test_gallery_is_one_card_with_shared_url_and_captions(self):
-        embeds = a.build_embeds(self.gallery_digest(3))
-        card, second, third = embeds[1], embeds[2], embeds[3]
-        self.assertEqual(card["title"], "📸 In pictures")
-        self.assertEqual(card["image"], {"url": "https://cdn.example.com/0.png"})
-        self.assertIn("1. [english 标题0](https://example.com/a0)", card["description"])
-        self.assertIn("3. [english 标题2](https://example.com/a2)", card["description"])
-        self.assertEqual(second, {"url": card["url"], "image": {"url": "https://cdn.example.com/1.png"}})
-        self.assertEqual(third["image"], {"url": "https://cdn.example.com/2.png"})
-        self.assertEqual(embeds[4]["title"], "🗞️ Headlines")
-        self.assertNotIn("image", embeds[0])
-
-    def test_no_gallery_without_images(self):
-        embeds = a.build_embeds(english())
-        self.assertNotIn("📸 In pictures", [e.get("title") for e in embeds])
-
-    def test_headlines_still_list_pictured_stories(self):
-        embeds = a.build_embeds(self.gallery_digest(2))
-        self.assertIn("english 标题1", embeds[-1]["description"])
-
     def test_headlines_are_grouped_and_linked(self):
-        text = a.build_embeds(english(items=2, flashes=1))[1]["description"]
+        text = a.build_embeds(english(items=2, flashes=1))[0]["description"]
         self.assertIn("**🧠 Models**", text)
         self.assertIn("• [english 标题1](https://example.com/a1)", text)
         self.assertIn("**⚡ Also**", text)
         self.assertIn("• [english 标题f0](https://example.com/af0)", text)
+
+    def test_each_story_is_listed_once(self):
+        raw = report(items=1, flashes=1)
+        raw["flashes"][0]["title"] = raw["sections"][0]["items"][0]["title"]
+        digest = a.translate(a.normalize(raw), fake_translator)
+        description = a.build_embeds(digest)[0]["description"]
+        self.assertEqual(description.count("english 标题0"), 1)
+        self.assertNotIn("⚡ Also", description)
 
     def test_headline_without_source_has_no_link(self):
         self.assertEqual(a.headline_line({"title": "Plain", "url": ""}), "• Plain")
 
     def test_section_emptied_by_top_story_is_dropped(self):
         embeds = a.build_embeds(english(items=1, flashes=1))
-        self.assertNotIn("Models", embeds[1]["description"])
+        self.assertNotIn("Models", embeds[0]["description"])
 
     def test_report_with_only_a_top_story_still_has_a_footer(self):
         embeds = a.build_embeds(english(items=1, flashes=0))
@@ -326,14 +230,18 @@ class FormatTests(unittest.TestCase):
 
     def test_report_without_lead(self):
         embeds = a.build_embeds(english(lead=False))
-        self.assertNotIn("description", embeds[0])
-        self.assertIn("english 标题0", embeds[1]["description"])
+        self.assertIn("english 标题0", embeds[0]["description"])
 
     def test_payload_never_links_to_aihot(self):
         digest = english(items=3, flashes=3)
         payload = json.dumps(a.build_messages(a.build_embeds(digest)), ensure_ascii=False)
         self.assertNotIn("aihot", payload.lower())
         self.assertNotIn("virxact", payload.lower())
+
+    def test_no_images_are_posted(self):
+        payload = json.dumps(a.build_messages(a.build_embeds(english(items=3))), ensure_ascii=False)
+        self.assertNotIn('"image"', payload)
+        self.assertNotIn("gallery", payload.lower())
 
     def test_last_embed_discloses_translation(self):
         footer = a.build_embeds(english())[-1]["footer"]["text"]
@@ -354,10 +262,6 @@ class FormatTests(unittest.TestCase):
 
     def test_typical_report_fits_one_message(self):
         digest = english(items=12, flashes=10)
-        digest["gallery"] = [
-            {**item, "image": f"https://cdn.example.com/{n}.png"}
-            for n, item in enumerate(digest["sections"][0]["items"][:4])
-        ]
         self.assertEqual(len(a.build_messages(a.build_embeds(digest))), 1)
 
     def test_huge_report_respects_discord_limits(self):
@@ -369,7 +273,7 @@ class FormatTests(unittest.TestCase):
             self.assertLessEqual(sum(a.embed_size(e) for e in message["embeds"]), 6000)
             for embed in message["embeds"]:
                 self.assertLessEqual(len(embed.get("description", "")), 4096)
-                self.assertLessEqual(len(embed["title"]), 256)
+                self.assertLessEqual(len(embed.get("title", "")), 256)
 
 
 class StateTests(unittest.TestCase):

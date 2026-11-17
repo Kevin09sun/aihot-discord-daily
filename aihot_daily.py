@@ -12,8 +12,6 @@ import argparse
 import copy
 import datetime as dt
 import html
-import http.client
-import ipaddress
 import json
 import os
 import re
@@ -38,12 +36,7 @@ MAX_EMBEDS = 10
 MAX_HEADLINE_CHARS = 110
 MAX_SUMMARY_CHARS = 220
 MAX_QUICK_HITS = 5
-MAX_GALLERY_IMAGES = 4  # Discord shows up to 4 images as one grid
-MAX_IMAGE_TRIES = 10
 MAX_URL_CHARS = 500
-MAX_IMAGE_URL_CHARS = 2000
-MAX_PAGE_BYTES = 1_000_000
-PAGE_TIMEOUT_SECONDS = 15
 MAX_TRANSLATION_INPUT = 2000
 MAX_BATCH_CHARS = 4000
 MAX_MYMEMORY_CHARS = 150  # MyMemory allows 500 bytes per request
@@ -157,7 +150,6 @@ def normalize(report):
         },
         "sections": sections,
         "flashes": flashes,
-        "gallery": [],
     }
 
 
@@ -290,85 +282,6 @@ def translate(digest, translator=translate_texts):
     return digest
 
 
-def usable_image(url):
-    """Reject images Discord can't load, and X profile pictures."""
-    if not url.startswith("https://") or len(url) > MAX_IMAGE_URL_CHARS or re.search(r"\s", url):
-        return False
-    try:
-        host = (urllib.parse.urlsplit(url).hostname or "").lower()
-    except ValueError:
-        return False
-    if not host or host == "localhost" or host.endswith(".local") or is_aihot_host(host):
-        return False
-    try:
-        ipaddress.ip_address(host)
-        return False
-    except ValueError:
-        pass
-    path = urllib.parse.urlsplit(url).path.lower()
-    return "/profile_images/" not in path and "logo" not in path
-
-
-def parse_preview_image(page, base_url):
-    """Return the page's Open Graph or Twitter preview image URL, or ""."""
-    found = {}
-    for tag in re.findall(rb"<meta\b[^>]*>", page, re.I):
-        name = re.search(rb"""(?:property|name)\s*=\s*["']([^"']+)["']""", tag, re.I)
-        content = re.search(rb"""content\s*=\s*"([^"]+)"|content\s*=\s*'([^']+)'""", tag, re.I)
-        if name and content:
-            key = name.group(1).decode("ascii", "ignore").lower()
-            value = content.group(1) or content.group(2)
-            found.setdefault(key, value.decode("utf-8", "replace"))
-    for key in ("og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"):
-        if key in found:
-            url = urllib.parse.urljoin(base_url, html.unescape(found[key]).strip())
-            if usable_image(url):
-                return url
-    return ""
-
-
-def open_page(url, read_bytes=0):
-    """Return (content type, body). Raises OSError or HTTPException on failure."""
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=PAGE_TIMEOUT_SECONDS) as resp:
-        return resp.headers.get_content_type(), resp.read(read_bytes) if read_bytes else b""
-
-
-def find_image(url):
-    """Find a story's preview image. Images are optional, so failures return ""."""
-    try:
-        content_type, page = open_page(url, MAX_PAGE_BYTES)
-        if "html" not in content_type:
-            return ""
-        image = parse_preview_image(page, url)
-        if not image:
-            return ""
-        content_type, _ = open_page(image)
-        return image if content_type.startswith("image/") else ""
-    except (OSError, ValueError, http.client.HTTPException) as err:
-        print(f"note: no image for {url[:80]}: {err}", file=sys.stderr)
-        return ""
-
-
-def attach_gallery(digest, finder=find_image):
-    """Collect up to 4 story images, trying the top story first, then the
-    other stories in report order, then quick hits. Returns how many were found."""
-    stories = [item for section in digest["sections"] for item in section["items"]]
-    lead_title = (digest["lead"] or {}).get("title")
-    stories.sort(key=lambda item: item["title"] != lead_title)
-    candidates = [i for i in stories + digest["flashes"] if i["url"]][:MAX_IMAGE_TRIES]
-    digest["gallery"] = []
-    seen_images = set()
-    for item in candidates:
-        if len(digest["gallery"]) >= MAX_GALLERY_IMAGES:
-            break
-        image = finder(item["url"])
-        if image and image not in seen_images:
-            seen_images.add(image)
-            digest["gallery"].append({**item, "image": image})
-    return len(digest["gallery"])
-
-
 def md(text, limit=None):
     """Escape Discord markdown in third-party text so it stays plain text."""
     return MARKDOWN.sub(r"\\\1", clean(text, limit))
@@ -416,54 +329,48 @@ def format_date(date):
 
 
 def build_embeds(digest):
-    lead, gallery = digest["lead"], digest["gallery"]
+    """Build the digest's embeds: one card, split only when it gets too long.
+
+    Every story appears once: the top story only in the header, and a story
+    whose title was already listed is skipped in later sections and quick hits.
+    """
     links = {i["title"]: i["url"] for s in digest["sections"] for i in s["items"]}
     shown = set()
-    header = {
-        "title": f"📰 Daily AI Report — {format_date(digest['date'])}",
-        "color": EMBED_COLOR,
-    }
-    if lead:
+    lines = []
+    if digest["lead"]:
+        lead = digest["lead"]
         shown.add(lead["title"])
         title = md(short_headline(lead["title"]))
         url = links.get(lead["title"])
-        parts = [f"**[{title}]({url})**" if url else f"**{title}**"]
+        lines.append(f"**[{title}]({url})**" if url else f"**{title}**")
         if lead["summary"]:
-            parts.append(md(first_sentence(lead["summary"])))
-        header["description"] = "\n".join(parts)
-    embeds = [header]
-
-    if gallery:
-        # Embeds sharing a url are shown by Discord as one card with an image grid.
-        captions = [
-            f"{n}. [{md(short_headline(item['title']))}]({item['url']})"
-            for n, item in enumerate(gallery, 1)
-        ]
-        embeds.append({
-            "title": "📸 In pictures",
-            "color": EMBED_COLOR,
-            "url": gallery[0]["url"],
-            "description": "\n".join(captions),
-            "image": {"url": gallery[0]["image"]},
-        })
-        embeds += [{"url": gallery[0]["url"], "image": {"url": i["image"]}} for i in gallery[1:]]
-
-    lines = []
+            lines.append(md(first_sentence(lead["summary"])))
     for section in digest["sections"]:
-        items = [i for i in section["items"] if i["title"] not in shown]
+        items = []
+        for item in section["items"]:
+            if item["title"] not in shown:
+                shown.add(item["title"])
+                items.append(item)
         if items:
             emoji, name = SECTION_STYLES.get(section["label"], DEFAULT_STYLE)
-            lines += [""] if lines else []
+            if lines:
+                lines.append("")
             lines.append(f"**{emoji} {name or md(section['label'])}**")
             lines += [headline_line(i) for i in items]
-    if digest["flashes"]:
-        lines += [""] if lines else []
+    flashes = [i for i in digest["flashes"] if i["title"] not in shown]
+    if flashes:
+        if lines:
+            lines.append("")
         lines.append("**⚡ Also**")
-        lines += [headline_line(i) for i in digest["flashes"]]
-    for index, page in enumerate(split_blocks(lines, "\n")):
-        title = "🗞️ Headlines" if index == 0 else "🗞️ Headlines (continued)"
-        embeds.append({"title": title, "color": EMBED_COLOR, "description": page.strip()})
+        lines += [headline_line(i) for i in flashes]
 
+    pages = split_blocks(lines, "\n")
+    embeds = [{
+        "title": f"📰 Daily AI Report — {format_date(digest['date'])}",
+        "color": EMBED_COLOR,
+        "description": pages[0].strip(),
+    }]
+    embeds += [{"color": EMBED_COLOR, "description": page.strip()} for page in pages[1:]]
     embeds[-1]["footer"] = {
         "text": "Machine-translated from Chinese, "
                 "so check the linked originals for exact details"
@@ -544,7 +451,6 @@ def main(argv=None):
         return 0
 
     digest = translate(normalize(report))
-    print(f"Images found: {attach_gallery(digest)}")
     messages = build_messages(build_embeds(digest))
 
     if args.dry_run:
